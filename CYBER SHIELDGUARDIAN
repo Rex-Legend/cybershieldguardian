@@ -1,1 +1,755 @@
+# watch_ui.py
+# CyberShield Guardian — Enhanced Watch UI (AI-style features)
+# Place firebase_config.json in the same folder for Firebase features
+# pip install streamlit firebase-admin pyttsx3 playsound speechrecognition pyaudio folium streamlit-folium geopy matplotlib numpy
 
+import streamlit as st
+from datetime import datetime, timedelta
+import random
+import time
+import threading
+import os
+import math
+import json
+
+# plotting
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Optional libs - import gracefully
+FIREBASE_AVAILABLE = False
+try:
+    import firebase_admin
+    from firebase_admin import credentials, db
+    FIREBASE_AVAILABLE = True
+except Exception:
+    FIREBASE_AVAILABLE = False
+
+PLAYSOUND_AVAILABLE = False
+try:
+    from playsound import playsound
+    PLAYSOUND_AVAILABLE = True
+except Exception:
+    PLAYSOUND_AVAILABLE = False
+
+TTS_AVAILABLE = False
+try:
+    import pyttsx3
+    TTS_AVAILABLE = True
+    tts_engine = pyttsx3.init()
+    tts_engine.setProperty("rate", 150)
+except Exception:
+    TTS_AVAILABLE = False
+
+SPEECH_AVAILABLE = False
+try:
+    import speech_recognition as sr
+    SPEECH_AVAILABLE = True
+    recognizer = sr.Recognizer()
+except Exception:
+    SPEECH_AVAILABLE = False
+
+FOLIUM_AVAILABLE = False
+try:
+    import folium
+    from streamlit_folium import st_folium
+    FOLIUM_AVAILABLE = True
+except Exception:
+    FOLIUM_AVAILABLE = False
+
+# geopy fallback for demo location
+try:
+    from geopy.geocoders import Nominatim
+    geolocator = Nominatim(user_agent="cybershield_guardian")
+except Exception:
+    geolocator = None
+
+# ----------------------
+# App config & styles
+# ----------------------
+st.set_page_config(page_title="CyberShield Guardian — Watch UI", page_icon="⌚", layout="wide")
+st.markdown(
+    """
+    <style>
+    .stApp {background-color:#05060a; color:#d3f4f4;}
+    .big {font-size:18px; color:#d3f4f4}
+    .accent {color:#00e6e6}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+st.title("🛡️ CyberShield Guardian — Watch Dashboard (AI Edition)")
+
+# ----------------------
+# Firebase / Files config
+# ----------------------
+FIREBASE_JSON = "firebase_config.json"
+DEFAULT_DB_HINT = "https://<project-id>-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+# session-state defaults (extended with BP + ECG)
+if "db_url" not in st.session_state:
+    st.session_state.db_url = ""
+if "device_id" not in st.session_state:
+    st.session_state.device_id = "watch-demo-001"
+if "hr" not in st.session_state:
+    st.session_state.hr = 78
+if "spo2" not in st.session_state:
+    st.session_state.spo2 = 98
+if "temp" not in st.session_state:
+    st.session_state.temp = 36.6
+if "systolic" not in st.session_state:
+    st.session_state.systolic = 118
+if "diastolic" not in st.session_state:
+    st.session_state.diastolic = 82
+if "ecg_rate" not in st.session_state:
+    st.session_state.ecg_rate = st.session_state.hr  # ECG beats/min matches HR by default
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "auto_push" not in st.session_state:
+    st.session_state.auto_push = False
+if "listener_running" not in st.session_state:
+    st.session_state.listener_running = False
+if "last_sos" not in st.session_state:
+    st.session_state.last_sos = None
+if "ai_insights_last" not in st.session_state:
+    st.session_state.ai_insights_last = None
+if "danger_threshold" not in st.session_state:
+    st.session_state.danger_threshold = 0.8
+if "danger_consecutive_required" not in st.session_state:
+    st.session_state.danger_consecutive_required = 2
+if "consecutive_danger_count" not in st.session_state:
+    st.session_state.consecutive_danger_count = 0
+if "sim_running" not in st.session_state:
+    st.session_state.sim_running = False
+if "sim_start_ts" not in st.session_state:
+    st.session_state.sim_start_ts = None
+if "sim_thread" not in st.session_state:
+    st.session_state.sim_thread = None
+if "escalated" not in st.session_state:
+    st.session_state.escalated = False
+
+# ----------------------
+# Helper functions
+# ----------------------
+def safe_print(*args, **kwargs):
+    try:
+        print(*args, **kwargs)
+    except Exception:
+        pass
+
+def compute_danger(hr, spo2, temp, systolic, diastolic, ecg_rate=None):
+    """Normalized danger score 0..1 from vitals (extended)"""
+    score = 0.0
+    # heart rate component
+    if hr > 100:
+        score += min((hr - 100) / 80.0, 0.4)
+    elif hr < 40:
+        score += min((40 - hr) / 80.0, 0.2)
+    # spo2 component
+    if spo2 < 95:
+        score += min((95 - spo2) / 50.0, 0.25)
+    # temperature component
+    if temp > 37.2:
+        score += min((temp - 37.2) / 3.0, 0.2)
+    # systolic high -> danger
+    if systolic > 120:
+        score += min((systolic - 120) / 80.0, 0.25)
+    # diastolic low -> danger
+    if diastolic < 80:
+        score += min((80 - diastolic) / 60.0, 0.2)
+    # ECG rate divergence (if provided)
+    if ecg_rate is not None:
+        if ecg_rate > 120:
+            score += min((ecg_rate - 120) / 200.0, 0.2)
+    return min(max(score, 0.0), 1.0)
+
+def estimate_emotion(hr, spo2, temp, hr_trend=0.0):
+    """
+    Very simple emotion/mood heuristic:
+    - calm: hr < 85 and spo2 > 96 and stable
+    - anxious: hr 85-110 or small spo2 drop or hr rising
+    - stressed: hr > 110 or spo2 low <92 or temp high
+    """
+    if hr > 110 or spo2 < 92 or temp > 38.0:
+        return "stressed"
+    if (hr >= 85 and hr <= 110) or (spo2 < 95) or (hr_trend > 2.0):
+        return "anxious"
+    return "calm"
+
+def speak_text(text):
+    if TTS_AVAILABLE:
+        try:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+        except Exception:
+            pass
+
+def get_demo_location():
+    # try geopy fallback
+    try:
+        if geolocator:
+            l = geolocator.geocode("Chennai, India", timeout=10)
+            if l:
+                return {"lat": l.latitude, "lon": l.longitude, "address": l.address}
+    except Exception:
+        pass
+    return {"lat": 13.0827, "lon": 80.2707, "address": "Chennai (fallback)"}
+
+def firebase_initialize(db_url):
+    """
+    Initialize firebase_admin with credentials and db_url.
+    Returns (ok, message)
+    """
+    if not FIREBASE_AVAILABLE:
+        return False, "firebase-admin not installed"
+    if not os.path.exists(FIREBASE_JSON):
+        return False, "firebase_config.json missing"
+    if not db_url:
+        return False, "no db_url provided"
+    try:
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(FIREBASE_JSON)
+            firebase_admin.initialize_app(cred, {"databaseURL": db_url})
+        return True, "initialized"
+    except Exception as e:
+        return False, str(e)
+
+def firebase_push(node, payload, db_url=None):
+    if not FIREBASE_AVAILABLE:
+        return False, "firebase-admin not installed"
+    if not db_url:
+        return False, "no db_url"
+    ok, msg = firebase_initialize(db_url)
+    if not ok:
+        return False, msg
+    try:
+        ref = db.reference(node)
+        ref.push(payload)
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+def push_ai_insight(insight_payload):
+    """
+    Push insight summary to firebase under ai_insights.
+    Mobile app reads /ai_insights/<latest>
+    """
+    db_url = st.session_state.db_url.strip()
+    if db_url and FIREBASE_AVAILABLE and os.path.exists(FIREBASE_JSON):
+        ok, msg = firebase_push("ai_insights", insight_payload, db_url=db_url)
+        return ok, msg
+    return False, "firebase not configured"
+
+def play_alert_sound_background():
+    # try playsound then TTS fallback
+    if PLAYSOUND_AVAILABLE and os.path.exists("alert.mp3"):
+        try:
+            playsound("alert.mp3")
+            return
+        except Exception as e:
+            safe_print("playsound error:", e)
+    # fallback TTS
+    for _ in range(2):
+        speak_text("Emergency. Emergency.")
+        time.sleep(0.2)
+
+# ----------------------
+# Background simulation thread
+# ----------------------
+def simulation_thread_fn(update_interval=5, escalate_after_seconds=120):
+    """
+    Runs in background while simulation is active.
+    - updates hr, spo2, temp, systolic, diastolic, ecg_rate periodically
+    - after escalate_after_seconds, applies escalation to simulate problem (BP rises / diastolic drops / ECG speeds)
+    """
+    safe_print("Simulation thread started")
+    start = time.time()
+    while st.session_state.sim_running:
+        elapsed = time.time() - start
+        # baseline fluctuations
+        base_hr = st.session_state.hr
+        base_spo2 = st.session_state.spo2
+        base_temp = st.session_state.temp
+        base_sys = st.session_state.systolic
+        base_dia = st.session_state.diastolic
+        # small random walk before escalation
+        if not st.session_state.escalated and elapsed < escalate_after_seconds:
+            st.session_state.hr = max(40, min(160, int(base_hr + random.randint(-3, 3))))
+            st.session_state.spo2 = max(85, min(100, int(base_spo2 + random.randint(-1, 1))))
+            st.session_state.temp = round(base_temp + random.uniform(-0.2, 0.2), 1)
+            st.session_state.systolic = max(90, min(130, int(base_sys + random.randint(-2, 2))))
+            st.session_state.diastolic = max(60, min(90, int(base_dia + random.randint(-1, 1))))
+            st.session_state.ecg_rate = st.session_state.hr
+        else:
+            # escalate once
+            if not st.session_state.escalated:
+                safe_print("Simulation escalation started")
+                st.session_state.escalated = True
+            # apply escalation pattern (heart rate & ECG speed up, systolic up, diastolic down, spo2 drops)
+            st.session_state.hr = max(80, min(190, int(st.session_state.hr + random.randint(8, 20))))
+            st.session_state.ecg_rate = int(st.session_state.hr + random.randint(0, 6))  # ECG slightly faster
+            st.session_state.systolic = int(st.session_state.systolic + random.randint(12, 28))
+            st.session_state.diastolic = max(50, int(st.session_state.diastolic - random.randint(6, 14)))
+            st.session_state.spo2 = max(80, int(st.session_state.spo2 - random.randint(0, 5)))
+            st.session_state.temp = round(st.session_state.temp + random.uniform(0, 0.6), 1)
+
+        # record history entry
+        entry = {
+            "ts": datetime.utcnow().isoformat(),
+            "hr": int(st.session_state.hr),
+            "spo2": int(st.session_state.spo2),
+            "temp": float(st.session_state.temp),
+            "systolic": int(st.session_state.systolic),
+            "diastolic": int(st.session_state.diastolic),
+            "ecg_rate": int(st.session_state.ecg_rate),
+            "source": "sim_watch"
+        }
+        st.session_state.history.append(entry)
+
+        # auto push if configured
+        if st.session_state.auto_push and st.session_state.db_url.strip():
+            try:
+                ok, msg = firebase_push("vitals", entry, db_url=st.session_state.db_url.strip())
+                safe_print("Auto-push vitals:", ok, msg)
+            except Exception as e:
+                safe_print("Auto-push error:", e)
+
+        # sleep then loop
+        time.sleep(update_interval)
+
+    safe_print("Simulation thread stopped")
+
+# ----------------------
+# Background voice listener (optional)
+# ----------------------
+listener_lock = threading.Lock()
+def background_voice_listener(owner_name, db_url_ref, lat_ref, lon_ref, stop_flag):
+    """
+    Listens for emergency keywords and triggers SOS. Requires microphone & speech_recognition.
+    This is for demo: it listens and on keywords sends voice_listener SOS to Firebase and marks session.
+    """
+    if not SPEECH_AVAILABLE:
+        safe_print("speech_recognition not installed")
+        return
+
+    with listener_lock:
+        safe_print("Background voice listener: starting")
+        try:
+            mic = sr.Microphone()
+        except Exception as e:
+            safe_print("Microphone not available:", e)
+            return
+
+        while not stop_flag.get("stop", False):
+            try:
+                with mic as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.6)
+                    audio = None
+                    try:
+                        audio = recognizer.listen(source, phrase_time_limit=4)
+                    except Exception as e:
+                        safe_print("listen error:", e)
+                        time.sleep(0.5)
+                        continue
+
+                if audio is None:
+                    time.sleep(0.2)
+                    continue
+
+                try:
+                    text = recognizer.recognize_google(audio).lower()
+                    safe_print("Voice heard:", text)
+                except Exception:
+                    time.sleep(0.2)
+                    continue
+
+                if any(k in text for k in ["help", "sos", "emergency", "ambulance", "danger"]):
+                    payload = {
+                        "owner": owner_name,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "source": "voice_listener",
+                        "text_detected": text,
+                        "lat": lat_ref,
+                        "lon": lon_ref,
+                        "type": "VOICE_SOS",
+                    }
+                    # play sound async
+                    threading.Thread(target=play_alert_sound_background, daemon=True).start()
+                    if db_url_ref:
+                        ok, msg = firebase_push("sos_events", payload, db_url=db_url_ref)
+                        safe_print("Pushed voice SOS:", ok, msg)
+                    st.session_state.last_sos = payload
+                    # also store AI insight
+                    insight = {
+                        "owner": owner_name,
+                        "ts": datetime.utcnow().isoformat(),
+                        "type": "voice_sos_auto",
+                        "note": f"Voice SOS triggered with text: {text}",
+                    }
+                    push_ai_insight(insight)
+                time.sleep(0.2)
+            except Exception as e:
+                safe_print("voice listener error:", e)
+                time.sleep(0.5)
+                continue
+        safe_print("Background voice listener: stopped")
+
+# ----------------------
+# AI-style Insight generation (local)
+# ----------------------
+def generate_ai_insight(history, owner_id, forecast, danger_score, emotion):
+    """
+    Create a compact natural-language insight for mobile display.
+    This is local simulation of 'AI' — no external calls.
+    """
+    now = datetime.utcnow().isoformat()
+    hr_vals = [h["hr"] for h in history[-12:]] if history else []
+    avg_hr = sum(hr_vals)/len(hr_vals) if hr_vals else None
+    last = history[-1] if history else None
+
+    lines = []
+    if last:
+        lines.append(f"Latest HR {last['hr']} bpm, SpO2 {last['spo2']}%, Temp {last['temp']}°C.")
+        lines.append(f"BP {last.get('systolic','?')}/{last.get('diastolic','?')} mmHg. ECG rate {last.get('ecg_rate','?')} bpm.")
+    if avg_hr:
+        lines.append(f"Average HR (recent): {avg_hr:.0f} bpm.")
+    lines.append(f"Emotion estimate: {emotion}. Danger score (next few min): {danger_score:.2f}.")
+    if max(forecast) >= 0.6:
+        lines.append("Short-term forecast indicates elevated risk. Consider immediate check or contacting help.")
+    elif danger_score >= 0.4:
+        lines.append("Monitor closely and rest; avoid strenuous activity for now.")
+    else:
+        lines.append("Vitals are within acceptable range. Continue routine monitoring.")
+
+    summary = " ".join(lines)
+    insight = {
+        "owner": owner_id,
+        "ts": now,
+        "summary": summary,
+        "danger": float(danger_score),
+        "emotion": emotion,
+        "forecast": [float(x) for x in forecast],
+    }
+    return insight
+
+def simple_linear_forecast(y_values, steps=3):
+    x = np.arange(len(y_values))
+    y = np.array(y_values, dtype=float)
+    if len(x) < 2 or np.allclose(y, y[0]):
+        return [float(y[-1])] * steps if len(y)>0 else [0.0]*steps
+    A = np.vstack([x, np.ones(len(x))]).T
+    m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+    future = []
+    for s in range(1, steps+1):
+        future.append(float(m * (len(x) + s - 1) + c))
+    return future
+
+# ----------------------
+# UI Layout
+# ----------------------
+col_left, col_right = st.columns([1, 2])
+
+with col_left:
+    st.header("Controls")
+    st.text_input("Device ID (used for nodes)", value=st.session_state.device_id, key="device_id_input", on_change=lambda: st.session_state._setitem_("device_id", st.session_state.device_id_input))
+
+    st.text_input("Firebase RTDB URL (region-aware)", value=st.session_state.db_url, key="db_url_input", help=f"Example: {DEFAULT_DB_HINT}", on_change=lambda: st.session_state._setitem_("db_url", st.session_state.db_url_input))
+
+    st.markdown("### Simulate Vitals / Actions")
+    if st.button("Randomize vitals now", key="rand_vitals_btn"):
+        st.session_state.hr = random.randint(55, 140)
+        st.session_state.spo2 = random.randint(88, 100)
+        st.session_state.temp = round(random.uniform(35.4, 39.0), 1)
+        st.session_state.systolic = random.randint(100, 125)
+        st.session_state.diastolic = random.randint(70, 88)
+        st.session_state.ecg_rate = st.session_state.hr
+        st.session_state.history.append({"ts": datetime.utcnow().isoformat(), "hr": st.session_state.hr, "spo2": st.session_state.spo2, "temp": st.session_state.temp, "systolic": st.session_state.systolic, "diastolic": st.session_state.diastolic, "ecg_rate": st.session_state.ecg_rate})
+        st.success("Vitals randomized.")
+
+    if st.button("Update vitals & record", key="update_vitals_btn"):
+        st.session_state.hr = random.randint(55, 140)
+        st.session_state.spo2 = random.randint(88, 100)
+        st.session_state.temp = round(random.uniform(35.4, 39.0), 1)
+        st.session_state.systolic = random.randint(100, 125)
+        st.session_state.diastolic = random.randint(70, 88)
+        st.session_state.ecg_rate = st.session_state.hr
+        entry = {"ts": datetime.utcnow().isoformat(), "hr": st.session_state.hr, "spo2": st.session_state.spo2, "temp": st.session_state.temp, "systolic": st.session_state.systolic, "diastolic": st.session_state.diastolic, "ecg_rate": st.session_state.ecg_rate}
+        st.session_state.history.append(entry)
+        st.success("Vitals updated & recorded.")
+        # auto push if enabled
+        if st.session_state.auto_push and st.session_state.db_url.strip():
+            payload = {"owner": st.session_state.device_id, "ts": entry["ts"], "hr": entry["hr"], "spo2": entry["spo2"], "temp": entry["temp"], "systolic": entry["systolic"], "diastolic": entry["diastolic"], "ecg_rate": entry["ecg_rate"], "source": "watch"}
+            ok, msg = firebase_push("vitals", payload, db_url=st.session_state.db_url.strip())
+            if ok:
+                st.info("Auto-pushed vitals to Firebase.")
+            else:
+                st.warning("Auto-push failed: " + str(msg))
+
+    st.checkbox("Auto push vitals to Firebase", value=st.session_state.auto_push, key="auto_push_chk", on_change=lambda: st.session_state._setitem_("auto_push", st.session_state.auto_push_chk))
+
+    st.markdown("---")
+    st.markdown("### Simulation Controls")
+    if not st.session_state.sim_running:
+        if st.button("▶️ Start Simulation (runs vitals every 5s; escalate after 2 min)", key="start_sim_btn"):
+            st.session_state.sim_running = True
+            st.session_state.sim_start_ts = time.time()
+            st.session_state.escalated = False
+            # start thread
+            t = threading.Thread(target=simulation_thread_fn, args=(5, 120), daemon=True)
+            st.session_state.sim_thread = t
+            t.start()
+            st.success("Simulation started.")
+    else:
+        if st.button("⏹ Stop Simulation", key="stop_sim_btn"):
+            st.session_state.sim_running = False
+            st.success("Simulation stop requested.")
+
+    st.markdown("---")
+    st.markdown("### SOS Controls")
+    if st.button("🔴 Trigger SOS (manual)", key="manual_sos_btn"):
+        loc = get_demo_location()
+        payload = {
+            "owner": st.session_state.device_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "hr": st.session_state.hr,
+            "spo2": st.session_state.spo2,
+            "temp": st.session_state.temp,
+            "systolic": st.session_state.systolic,
+            "diastolic": st.session_state.diastolic,
+            "ecg_rate": st.session_state.ecg_rate,
+            "lat": loc["lat"],
+            "lon": loc["lon"],
+            "address": loc["address"],
+            "type": "MANUAL_SOS",
+            "source": "watch",
+        }
+        threading.Thread(target=play_alert_sound_background, daemon=True).start()
+        dburl = st.session_state.db_url.strip()
+        if dburl:
+            ok, msg = firebase_push("sos_events", payload, db_url=dburl)
+            if ok:
+                st.success("SOS pushed to Firebase.")
+            else:
+                st.error("Failed to push SOS: " + str(msg))
+        else:
+            st.warning("DB URL not set — SOS saved locally.")
+        st.session_state.last_sos = payload
+        # push AI insight about SOS
+        insight = {"owner": st.session_state.device_id, "ts": datetime.utcnow().isoformat(), "type": "manual_sos", "summary": "Manual SOS triggered from watch."}
+        push_ai_insight(insight)
+
+    st.markdown("---")
+    st.markdown("### Voice Listener (optional)")
+    if not st.session_state.listener_running:
+        if SPEECH_AVAILABLE:
+            if st.button("🎙️ Start voice listener", key="start_listener_btn"):
+                stop_flag = {"stop": False}
+                st.session_state._listener_stop_flag = stop_flag
+                demo_loc = get_demo_location()
+                threading.Thread(target=background_voice_listener, args=(st.session_state.device_id, st.session_state.db_url.strip(), demo_loc["lat"], demo_loc["lon"], stop_flag), daemon=True).start()
+                st.session_state.listener_running = True
+                st.success("Background voice listener started.")
+        else:
+            st.info("SpeechRecognition not available — install speech_recognition + pyaudio to enable voice features.")
+    else:
+        if st.button("🛑 Stop listener", key="stop_listener_btn"):
+            if hasattr(st.session_state, "_listener_stop_flag"):
+                st.session_state._listener_stop_flag["stop"] = True
+            st.session_state.listener_running = False
+            st.info("Listener stop requested.")
+
+    st.markdown("---")
+    st.markdown("### Prediction & AI Settings")
+    st.slider("ECG synthetic length (samples)", 256, 2048, 512, key="ecg_len_slider")
+    st.slider("Forecast horizon (minutes)", 1, 10, 3, key="forecast_horizon_slider")
+    st.number_input("Danger threshold (0-1)", min_value=0.1, max_value=1.0, value=st.session_state.danger_threshold, step=0.1, key="danger_threshold_input", on_change=lambda: st.session_state._setitem_("danger_threshold", float(st.session_state.danger_threshold_input)))
+    st.number_input("Consecutive danger count to auto-SOS", min_value=1, max_value=5, value=st.session_state.danger_consecutive_required, step=1, key="danger_consec_input", on_change=lambda: st.session_state._setitem_("danger_consecutive_required", int(st.session_state.danger_consec_input)))
+
+    st.markdown("---")
+    st.markdown("### App files")
+    st.write(f"firebase-admin installed: {FIREBASE_AVAILABLE}")
+    st.write(f"firebase_config.json present: {os.path.exists(FIREBASE_JSON)}")
+    st.write(f"p y t t s 3 available: {TTS_AVAILABLE}")
+    st.write(f"playsound available: {PLAYSOUND_AVAILABLE}")
+    st.write(f"speech_recognition available: {SPEECH_AVAILABLE}")
+    st.write(f"folium/streamlit-folium available: {FOLIUM_AVAILABLE}")
+
+with col_right:
+    st.header("Live Watch Dashboard (AI)")
+    # Vitals card
+    st.subheader("Vitals Snapshot")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Heart Rate (bpm)", st.session_state.hr)
+    c2.metric("SpO₂ (%)", st.session_state.spo2)
+    c3.metric("Temperature (°C)", st.session_state.temp)
+    c4.metric("Danger Probability", f"{compute_danger(st.session_state.hr, st.session_state.spo2, st.session_state.temp, st.session_state.systolic, st.session_state.diastolic, st.session_state.ecg_rate):.2f}")
+
+    # BP + ECG display
+    st.markdown("---")
+    st.subheader("Blood Pressure & ECG")
+    b1, b2 = st.columns(2)
+    b1.metric("BP (Sys/Diastolic)", f"{st.session_state.systolic}/{st.session_state.diastolic} mmHg")
+    b2.metric("ECG Rate (bpm)", st.session_state.ecg_rate)
+
+    # ensure we have history data seeded
+    if len(st.session_state.history) < 6:
+        base = datetime.utcnow() - timedelta(minutes=6)
+        for i in range(6):
+            st.session_state.history.append({"ts": (base + timedelta(minutes=i)).isoformat(), "hr": st.session_state.hr + random.randint(-4,4), "spo2": st.session_state.spo2 + random.randint(-1,1), "temp": round(st.session_state.temp + random.uniform(-0.3,0.3),1), "systolic": st.session_state.systolic, "diastolic": st.session_state.diastolic, "ecg_rate": st.session_state.ecg_rate})
+
+    # compute trend
+    hr_list = [int(x["hr"]) for x in st.session_state.history[-12:]] if st.session_state.history else [st.session_state.hr]
+    hr_trend = 0.0
+    if len(hr_list) >= 2:
+        hr_trend = hr_list[-1] - hr_list[-2]
+
+    # ECG simulator (uses ecg_rate now)
+    st.markdown("---")
+    st.subheader("ECG Simulator (synthetic)")
+    def generate_ecg(samples=512, hr=78, noise=0.04):
+        fs = 250.0
+        duration = samples / fs
+        rr = 60.0 / max(30, hr)
+        t = np.linspace(0, duration, samples)
+        signal = np.zeros_like(t)
+        beat_times = np.arange(0, duration + rr, rr)
+        for bt in beat_times:
+            signal += np.exp(-((t - bt) * 2) / (2 * (0.02 * 2))) * 1.0
+            signal += 0.2 * np.exp(-((t - (bt - 0.18)) * 2) / (2 * (0.03 * 2)))
+            signal += 0.25 * np.exp(-((t - (bt + 0.25)) * 2) / (2 * (0.04 * 2)))
+        signal = signal + 0.02 * np.sin(2 * math.pi * 0.5 * t) + noise * np.random.randn(len(t))
+        return t, signal
+
+    t_ecg, s_ecg = generate_ecg(samples=st.session_state.ecg_len_slider, hr=st.session_state.ecg_rate, noise=0.03)
+    fig_ecg, ax_ecg = plt.subplots(figsize=(9,2))
+    ax_ecg.plot(t_ecg, s_ecg)
+    ax_ecg.set_xlim(0, max(t_ecg))
+    ax_ecg.set_yticks([])
+    ax_ecg.set_title("Synthetic ECG waveform (demo)")
+    st.pyplot(fig_ecg)
+
+    # Danger predictor & forecast
+    st.markdown("---")
+    st.subheader("Short-term Danger Predictor (local AI)")
+    dangers = [compute_danger(int(x.get("hr",0)), int(x.get("spo2",0)), float(x.get("temp",0)), int(x.get("systolic",120)), int(x.get("diastolic",80)), int(x.get("ecg_rate", x.get("hr",78)))) for x in st.session_state.history[-12:]]
+    forecast = simple_linear_forecast(dangers, steps=int(st.session_state.forecast_horizon_slider))
+    fig_pred, axp = plt.subplots(figsize=(8,3))
+    xidx = np.arange(len(dangers))
+    axp.plot(xidx, dangers, marker='o', label='past danger')
+    axp.plot(np.arange(len(dangers), len(dangers)+len(forecast)), forecast, marker='x', linestyle='--', label='forecast')
+    axp.set_ylim(0, 1.0)
+    axp.set_xlabel("sample index (older → newer)")
+    axp.set_ylabel("danger probability")
+    axp.legend()
+    st.pyplot(fig_pred)
+
+    # Generate AI insight summary (local)
+    danger_score = compute_danger(st.session_state.hr, st.session_state.spo2, st.session_state.temp, st.session_state.systolic, st.session_state.diastolic, st.session_state.ecg_rate)
+    emotion = estimate_emotion(st.session_state.hr, st.session_state.spo2, st.session_state.temp, hr_trend)
+    ai_insight = generate_ai_insight(st.session_state.history, st.session_state.device_id, forecast, danger_score, emotion)
+    st.session_state.ai_insights_last = ai_insight
+
+    st.markdown("*AI Insight (summary):*")
+    st.success(ai_insight["summary"])
+    st.caption(f"Emotion: {ai_insight['emotion']} — Danger: {ai_insight['danger']:.2f}")
+
+    # Push AI insight to Firebase if available
+    if st.button("Push AI insight to Firebase (mobile reads this)", key="push_ai_btn"):
+        ok, msg = push_ai_insight(ai_insight)
+        if ok:
+            st.success("Insight pushed to Firebase under /ai_insights")
+        else:
+            st.error("Failed to push insight: " + str(msg))
+
+    # Auto-SOS logic
+    st.markdown("---")
+    st.subheader("Auto-SOS / Watch Intelligence")
+    st.write("Auto-SOS will trigger when danger > threshold for N consecutive checks (configurable on left).")
+    # evaluate danger on latest snapshot
+    if danger_score >= st.session_state.danger_threshold:
+        st.session_state.consecutive_danger_count += 1
+    else:
+        st.session_state.consecutive_danger_count = 0
+
+    st.write(f"Consecutive danger detections: {st.session_state.consecutive_danger_count}")
+    if st.session_state.consecutive_danger_count >= st.session_state.danger_consecutive_required:
+        st.warning("Auto-SOS condition met — preparing to trigger SOS.")
+        # compose payload
+        loc = get_demo_location()
+        payload = {
+            "owner": st.session_state.device_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "hr": st.session_state.hr,
+            "spo2": st.session_state.spo2,
+            "temp": st.session_state.temp,
+            "systolic": st.session_state.systolic,
+            "diastolic": st.session_state.diastolic,
+            "ecg_rate": st.session_state.ecg_rate,
+            "lat": loc["lat"],
+            "lon": loc["lon"],
+            "address": loc["address"],
+            "type": "AUTO_SOS",
+            "reason": f"danger_score:{danger_score:.2f} consecutive:{st.session_state.consecutive_danger_count}",
+            "source": "watch",
+        }
+        # play alarm and push
+        threading.Thread(target=play_alert_sound_background, daemon=True).start()
+        if st.session_state.db_url.strip():
+            ok, msg = firebase_push("sos_events", payload, db_url=st.session_state.db_url.strip())
+            if ok:
+                st.success("Auto-SOS pushed to Firebase.")
+            else:
+                st.error("Auto-SOS push failed: " + str(msg))
+        else:
+            st.warning("DB URL not configured; Auto-SOS not sent to remote DB.")
+        st.session_state.last_sos = payload
+        # push an AI insight too
+        insight = {"owner": st.session_state.device_id, "ts": datetime.utcnow().isoformat(), "type": "auto_sos", "summary": f"Auto-SOS triggered due to repeated high danger ({danger_score:.2f})"}
+        push_ai_insight(insight)
+        # reset count so we don't spam
+        st.session_state.consecutive_danger_count = 0
+
+    st.markdown("---")
+    # Map / Location
+    st.subheader("Last Known Location")
+    user_loc = get_demo_location()
+    st.write(f"Last known: *{user_loc['address']}* — ({user_loc['lat']:.5f}, {user_loc['lon']:.5f})")
+    if FOLIUM_AVAILABLE:
+        m = folium.Map(location=[user_loc["lat"], user_loc["lon"]], zoom_start=14)
+        folium.Marker([user_loc["lat"], user_loc["lon"]], popup="Watch", tooltip="watch").add_to(m)
+        st_folium(m, width=700, height=300)
+    else:
+        st.info("Map not available (install folium & streamlit-folium).")
+
+    st.markdown("---")
+    # Guardian chat (local AI)
+    st.subheader("Guardian AI Chat (local)")
+    ai_q = st.text_input("Ask the assistant about vitals or say 'help' (local only)", key="ai_query_input")
+    if st.button("Ask", key="ai_query_btn"):
+        q = (ai_q or "").strip().lower()
+        reply = "I am monitoring your vitals continuously."
+        if "help" in q or "emergency" in q:
+            reply = "Detected emergency keywords. If you are in danger, press the SOS button."
+            # optionally trigger speech
+            speak_text(reply)
+        elif "hr" in q or "heart" in q:
+            reply = f"Current heart rate is {st.session_state.hr} bpm (trend {hr_trend:+} bpm)."
+        elif "where" in q or "location" in q:
+            reply = f"Last known location: {user_loc['address']} ({user_loc['lat']:.5f},{user_loc['lon']:.5f})"
+        elif "insight" in q or "advice" in q:
+            reply = ai_insight["summary"]
+        else:
+            reply = "I am watching your vitals and predicting short-term trends. Ask 'insight' for recommendations."
+        st.success(reply)
+        speak_text(reply)
+
+    st.markdown("---")
+    st.subheader("Logs & Last SOS")
+    st.write("Last local SOS payload:")
+    st.json(st.session_state.last_sos)
+    if st.checkbox("Show recent vitals history", key="show_hist_checkbox"):
+        for rec in reversed(st.session_state.history[-50:]):
+            st.write(f"{rec['ts']} — HR:{rec['hr']} SpO2:{rec['spo2']} Temp:{rec['temp']} BP:{rec.get('systolic','?')}/{rec.get('diastolic','?')} ECG:{rec.get('ecg_rate','?')}")
+
+# Footer / tips
+st.markdown("---")
